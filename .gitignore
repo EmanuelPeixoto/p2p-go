@@ -1,0 +1,4 @@
+build/
+peer-*.log
+downloads/
+*.tmp
