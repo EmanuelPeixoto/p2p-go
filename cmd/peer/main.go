@@ -84,7 +84,7 @@ func main() {
 		discoveryAddrs = append(discoveryAddrs, fmt.Sprintf("127.0.0.1:%d", discPort))
 	}
 
-	fs := fileserver.New(*shareDir, *id)
+	fs := fileserver.New(*shareDir, *downloadDir, *id)
 	fln, err := net.Listen("tcp", fileAddr)
 	if err != nil {
 		log.Fatalf("fileserver: %v", err)
@@ -304,19 +304,39 @@ func resolveTarget(catalog []FileEntry, target string) *FileEntry {
 }
 
 // doDownload tenta baixar de cada fonte em ordem de latência.
-// Mede a latência de cada fonte em paralelo e usa a mais rápida primeiro.
+// Exibe barra de progresso em tempo real. Se falhar, tenta a próxima fonte.
 func doDownload(node *peer.Node, filename string, sources []string, downloadDir string) {
 	ordered := rankByLatency(sources)
 
 	for i, src := range ordered {
-		label := src
 		if len(ordered) > 1 {
-			label = fmt.Sprintf("%s (opção %d/%d)", src, i+1, len(ordered))
+			fmt.Printf("  Fonte %d/%d: %s\n", i+1, len(ordered), src)
+		} else {
+			fmt.Printf("  Baixando de %s\n", src)
 		}
-		fmt.Printf("  Baixando de %s ...\n", label)
+
+		// Canal de progresso — goroutine imprime a barra
+		progressCh := make(chan float64, 10)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			var last float64
+			for pct := range progressCh {
+				last = pct
+				printProgress(pct)
+			}
+			if last > 0 {
+				fmt.Println() // quebra a linha da barra
+			}
+		}()
+
 		start := time.Now()
-		if err := node.Download(src, filename); err != nil {
-			fmt.Printf("  ✗ Falhou: %v\n", err)
+		err := node.Download(src, filename, progressCh)
+		close(progressCh)
+		<-done // espera a goroutine de progresso terminar
+
+		if err != nil {
+			fmt.Printf("  ✗ %v\n", err)
 			if i+1 < len(ordered) {
 				fmt.Println("  Tentando próxima fonte...")
 			}
@@ -327,6 +347,15 @@ func doDownload(node *peer.Node, filename string, sources []string, downloadDir 
 		return
 	}
 	fmt.Println("  Erro: nenhuma fonte disponível.")
+}
+
+// printProgress imprime uma barra de progresso na mesma linha (\r).
+func printProgress(pct float64) {
+	const width = 30
+	filled := int(pct / 100 * width)
+	if filled > width { filled = width }
+	bar := "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
+	fmt.Printf("\r  %s %5.1f%%", bar, pct)
 }
 
 // rankByLatency mede o tempo de conexão TCP a cada fonte em paralelo
@@ -348,7 +377,7 @@ func rankByLatency(sources []string) []string {
 			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 			lat := time.Since(start)
 			if err != nil {
-				lat = 999 * time.Second // penaliza inacessíveis
+				lat = 999 * time.Second // inacessível: vai para o fim da fila de tentativas
 			} else {
 				conn.Close()
 			}
@@ -373,6 +402,7 @@ func rankByLatency(sources []string) []string {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
+// printHelp exibe os comandos disponiveis no terminal.
 func printHelp() {
 	fmt.Println("  ls              — listar todos os arquivos da rede (numerados)")
 	fmt.Println("  get <N ou nome> — baixar arquivo pelo número ou nome")

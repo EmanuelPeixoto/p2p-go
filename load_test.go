@@ -25,7 +25,7 @@ func startDiscovery(t *testing.T) string {
 }
 
 func startFileServer(t *testing.T, dir, id string) string {
-	fs := fileserver.New(dir, id)
+	fs := fileserver.New(dir, dir, id)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil { t.Fatal(err) }
 	go fs.ServeListener(ln)
@@ -71,7 +71,7 @@ func TestConcurrentDownloads(t *testing.T) {
 			node.Start()
 
 			t0 := time.Now()
-			err := node.Download(fsAddr, "arquivo.bin")
+			err := node.Download(fsAddr, "arquivo.bin", nil)
 			totalMS.Add(time.Since(t0).Milliseconds())
 
 			if err != nil {

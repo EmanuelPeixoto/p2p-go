@@ -1,5 +1,6 @@
-// Package fileserver handles the file-sharing side of each peer:
-// listing shared files and serving downloads directly to other peers.
+// Package fileserver serve arquivos a outros peers — completos ou parciais.
+// Arquivos em download (.part) também são compartilhados, com a porcentagem
+// já recebida, para que outros peers possam baixar o que já existe.
 package fileserver
 
 import (
@@ -11,28 +12,25 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"p2p/internal/protocol"
 )
 
-// Server listens for file requests from other peers.
+// Server escuta requisições de arquivo de outros peers.
 type Server struct {
-	ShareDir string
-	PeerID   string
+	ShareDir   string // arquivos completos para compartilhar
+	DownloadDir string // onde ficam os .part (downloads em andamento)
+	PeerID     string
 }
 
-func New(shareDir, peerID string) *Server {
-	return &Server{ShareDir: shareDir, PeerID: peerID}
+func New(shareDir, downloadDir, peerID string) *Server {
+	return &Server{ShareDir: shareDir, DownloadDir: downloadDir, PeerID: peerID}
 }
 
-// Serve starts the file server on addr.
-func (s *Server) Serve(addr string) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("fileserver listen %s: %w", addr, err)
-	}
-	log.Printf("[fileserver] listening on %s  share=%s", addr, s.ShareDir)
+// ServeListener aceita conexões num listener já aberto.
+func (s *Server) ServeListener(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -67,40 +65,103 @@ func (s *Server) handle(conn net.Conn) {
 			sendError(conn, "bad download request")
 			return
 		}
-		s.sendFile(conn, req.Filename)
+		s.sendFile(conn, req.Filename, req.Offset, req.Length)
 
 	default:
 		sendError(conn, "unexpected message: "+env.Type)
 	}
 }
 
+// listFiles lista arquivos completos (ShareDir) e parciais (DownloadDir).
 func (s *Server) listFiles() ([]protocol.FileInfo, error) {
-	entries, err := os.ReadDir(s.ShareDir)
-	if err != nil {
+	var files []protocol.FileInfo
+
+	// 1. Arquivos completos na pasta de compartilhamento
+	if err := addCompleteFiles(s.ShareDir, &files); err != nil {
 		return nil, err
 	}
-	var files []protocol.FileInfo
+
+	// 2. Arquivos parciais (.part) na pasta de downloads
+	addPartialFiles(s.DownloadDir, &files)
+
+	return files, nil
+}
+
+func addCompleteFiles(dir string, out *[]protocol.FileInfo) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || strings.HasSuffix(e.Name(), ".part") || strings.HasSuffix(e.Name(), ".state") {
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		files = append(files, protocol.FileInfo{Name: e.Name(), Size: info.Size()})
+		*out = append(*out, protocol.FileInfo{
+			Name:     e.Name(),
+			Size:     info.Size(),
+			Have:     info.Size(),
+			Complete: true,
+			Percent:  100,
+		})
 	}
-	return files, nil
+	return nil
 }
 
-func (s *Server) sendFile(conn net.Conn, filename string) {
-	// Security: reject path traversal attempts
+func addPartialFiles(dir string, out *[]protocol.FileInfo) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".part") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		// Lê o arquivo de estado para saber o tamanho total
+		baseName := strings.TrimSuffix(e.Name(), ".part")
+		state := loadState(filepath.Join(dir, baseName+".state"))
+		if state == nil || state.TotalSize == 0 {
+			continue // sem estado válido não sabemos o tamanho total
+		}
+		have := info.Size()
+		pct := float64(have) / float64(state.TotalSize) * 100
+		*out = append(*out, protocol.FileInfo{
+			Name:     baseName,
+			Size:     state.TotalSize,
+			Have:     have,
+			Complete: false,
+			Percent:  pct,
+		})
+	}
+}
+
+// sendFile envia um trecho (ou o arquivo inteiro) ao peer solicitante.
+// Procura primeiro na ShareDir (completo), depois na DownloadDir (.part).
+func (s *Server) sendFile(conn net.Conn, filename string, offset, length int64) {
 	clean := filepath.Base(filename)
+
+	// Tenta arquivo completo primeiro
 	path := filepath.Join(s.ShareDir, clean)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		// Tenta o .part em downloads
+		partPath := filepath.Join(s.DownloadDir, clean+".part")
+		if _, err2 := os.Stat(partPath); err2 != nil {
+			sendError(conn, fmt.Sprintf("file not found: %s", clean))
+			return
+		}
+		path = partPath
+	}
 
 	f, err := os.Open(path)
 	if err != nil {
-		sendError(conn, fmt.Sprintf("file not found: %s", clean))
+		sendError(conn, fmt.Sprintf("cannot open: %s", clean))
 		return
 	}
 	defer f.Close()
@@ -111,56 +172,99 @@ func (s *Server) sendFile(conn net.Conn, filename string) {
 		return
 	}
 
-	// Send metadata first
+	// Determina o tamanho total real (pode ser .part de um arquivo maior)
+	totalSize := info.Size()
+	state := loadState(filepath.Join(s.DownloadDir, clean+".state"))
+	if state != nil && state.TotalSize > 0 {
+		totalSize = state.TotalSize
+	}
+
+	// Calcula trecho a enviar
+	if offset < 0 || offset > info.Size() {
+		sendError(conn, fmt.Sprintf("invalid offset %d (have %d bytes)", offset, info.Size()))
+		return
+	}
+	available := info.Size() - offset
+	chunkSize := available
+	if length > 0 && length < chunkSize {
+		chunkSize = length
+	}
+
+	// Envia metadados
 	if err := protocol.Send(conn, protocol.MsgFileData, protocol.FileDataPayload{
-		Filename: clean,
-		Size:     info.Size(),
+		Filename:  clean,
+		Size:      totalSize,
+		Offset:    offset,
+		ChunkSize: chunkSize,
 	}); err != nil {
 		return
 	}
 
-	// Stream raw bytes, compute checksum
+	// Posiciona no offset solicitado
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			log.Printf("[fileserver] seek error: %v", err)
+			return
+		}
+	}
+
+	// Envia os bytes + checksum MD5 do trecho
 	h := md5.New()
 	buf := make([]byte, 32*1024)
-	total := int64(0)
-	for {
-		n, err := f.Read(buf)
+	remaining := chunkSize
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Minute))
+
+	for remaining > 0 {
+		toRead := int64(len(buf))
+		if toRead > remaining {
+			toRead = remaining
+		}
+		n, err := f.Read(buf[:toRead])
 		if n > 0 {
 			chunk := buf[:n]
 			h.Write(chunk)
 			if _, werr := conn.Write(chunk); werr != nil {
-				log.Printf("[fileserver] write error sending %s: %v", clean, werr)
+				log.Printf("[fileserver] write error: %v", werr)
 				return
 			}
-			total += int64(n)
+			remaining -= int64(n)
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			log.Printf("[fileserver] read error for %s: %v", clean, err)
 			return
 		}
 	}
 	checksum := hex.EncodeToString(h.Sum(nil))
-	log.Printf("[fileserver] sent %s (%d bytes, md5=%s)", clean, total, checksum)
-
-	// Send checksum as a trailing newline-delimited line so client can verify
+	log.Printf("[fileserver] sent %s offset=%d chunk=%d md5=%s", clean, offset, chunkSize, checksum)
 	conn.Write([]byte("\n" + checksum + "\n"))
+}
+
+// DownloadState é persistido em disco (.state) para retomar downloads.
+type DownloadState struct {
+	TotalSize int64  `json:"total_size"`
+	Received  int64  `json:"received"`
+}
+
+func loadState(path string) *DownloadState {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	// formato simples: "total received\n"
+	var s DownloadState
+	fmt.Sscanf(string(data), "%d %d", &s.TotalSize, &s.Received)
+	if s.TotalSize == 0 {
+		return nil
+	}
+	return &s
+}
+
+func SaveState(path string, totalSize, received int64) error {
+	return os.WriteFile(path, []byte(fmt.Sprintf("%d %d\n", totalSize, received)), 0644)
 }
 
 func sendError(conn net.Conn, msg string) {
 	_ = protocol.Send(conn, protocol.MsgError, protocol.ErrorPayload{Message: msg})
-}
-
-// ServeListener accepts on an already-bound listener.
-func (s *Server) ServeListener(ln net.Listener) error {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("[fileserver] accept error: %v", err)
-			continue
-		}
-		go s.handle(conn)
-	}
 }

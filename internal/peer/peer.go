@@ -1,6 +1,7 @@
-// Package peer implements the core peer node logic:
-// joining the network, discovering other peers, gossiping,
-// and downloading files from peers.
+// Package peer implementa a lógica principal do nó P2P:
+// registro na rede, descoberta de peers, gossip e download de arquivos.
+// Downloads são retomáveis: o estado é salvo em .part + .state,
+// e arquivos parciais ficam disponíveis para outros peers baixarem.
 package peer
 
 import (
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"p2p/internal/fileserver"
 	"p2p/internal/protocol"
 )
 
@@ -27,15 +29,15 @@ const (
 	dialTimeout       = 5 * time.Second
 )
 
-// Node is a peer in the P2P network.
+// Node é um peer na rede P2P.
 type Node struct {
-	ID           string
-	Addr         string // our own host:port (file server address)
-	DownloadDir  string
-	DiscoveryAddrs []string // list of known discovery nodes
+	ID             string
+	Addr           string   // host:porta do fileserver próprio
+	DownloadDir    string
+	DiscoveryAddrs []string
 
 	mu    sync.RWMutex
-	peers map[string]protocol.PeerInfo // discovered peers
+	peers map[string]protocol.PeerInfo
 }
 
 func New(id, addr, downloadDir string, discoveryAddrs []string) *Node {
@@ -48,23 +50,22 @@ func New(id, addr, downloadDir string, discoveryAddrs []string) *Node {
 	}
 }
 
-// Start registers with discovery nodes and begins background tasks.
+// Start registra nos discovery nodes e inicia as goroutines de fundo.
 func (n *Node) Start() {
 	n.registerWithAll()
 	go n.heartbeatLoop()
 	go n.gossipLoop()
 }
 
-// registerWithAll tries to register with every configured discovery node.
 func (n *Node) registerWithAll() {
 	for _, addr := range n.DiscoveryAddrs {
 		peers, err := n.registerWith(addr)
 		if err != nil {
-			log.Printf("[peer] could not reach discovery %s: %v", addr, err)
+			log.Printf("[peer] discovery %s indisponível: %v", addr, err)
 			continue
 		}
 		n.mergePeers(peers)
-		log.Printf("[peer] registered with discovery %s, got %d peers", addr, len(peers))
+		log.Printf("[peer] registrado em %s, %d peers conhecidos", addr, len(peers))
 	}
 }
 
@@ -74,14 +75,11 @@ func (n *Node) registerWith(discoveryAddr string) ([]protocol.PeerInfo, error) {
 		return nil, err
 	}
 	defer conn.Close()
-
 	if err := protocol.Send(conn, protocol.MsgRegister, protocol.RegisterPayload{
-		ID:   n.ID,
-		Addr: n.Addr,
+		ID: n.ID, Addr: n.Addr,
 	}); err != nil {
 		return nil, err
 	}
-
 	env, err := protocol.Recv(conn, 10*time.Second)
 	if err != nil {
 		return nil, err
@@ -92,7 +90,7 @@ func (n *Node) registerWith(discoveryAddr string) ([]protocol.PeerInfo, error) {
 		return nil, fmt.Errorf("discovery error: %s", e.Message)
 	}
 	if env.Type != protocol.MsgPeerList {
-		return nil, fmt.Errorf("unexpected response: %s", env.Type)
+		return nil, fmt.Errorf("resposta inesperada: %s", env.Type)
 	}
 	var pl protocol.PeerListPayload
 	if err := protocol.Decode(env, &pl); err != nil {
@@ -101,14 +99,14 @@ func (n *Node) registerWith(discoveryAddr string) ([]protocol.PeerInfo, error) {
 	return pl.Peers, nil
 }
 
-// heartbeatLoop periodically re-registers with discovery nodes.
 func (n *Node) heartbeatLoop() {
 	for range time.Tick(heartbeatInterval) {
 		n.registerWithAll()
 	}
 }
 
-// gossipLoop shares peer knowledge with random peers to maintain resilience.
+// gossipLoop compartilha peers conhecidos com um nó aleatório a cada 30s.
+// Garante resiliência: se o discovery cair, peers continuam se encontrando.
 func (n *Node) gossipLoop() {
 	for range time.Tick(gossipInterval) {
 		n.gossip()
@@ -122,23 +120,18 @@ func (n *Node) gossip() {
 		peerList = append(peerList, p)
 	}
 	n.mu.RUnlock()
-
 	if len(peerList) == 0 {
 		return
 	}
-
-	// Pick a random peer to gossip with
 	target := peerList[rand.Intn(len(peerList))]
 	if target.ID == n.ID {
 		return
 	}
-
 	conn, err := net.DialTimeout("tcp", target.Addr, dialTimeout)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
-
 	_ = protocol.Send(conn, protocol.MsgGossip, protocol.GossipPayload{Peers: peerList})
 }
 
@@ -147,7 +140,7 @@ func (n *Node) mergePeers(peers []protocol.PeerInfo) {
 	defer n.mu.Unlock()
 	for _, p := range peers {
 		if p.ID == n.ID {
-			continue // don't add ourselves
+			continue
 		}
 		if existing, ok := n.peers[p.ID]; !ok || p.LastSeen.After(existing.LastSeen) {
 			n.peers[p.ID] = p
@@ -155,7 +148,6 @@ func (n *Node) mergePeers(peers []protocol.PeerInfo) {
 	}
 }
 
-// Peers returns a snapshot of known active peers.
 func (n *Node) Peers() []protocol.PeerInfo {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
@@ -166,7 +158,6 @@ func (n *Node) Peers() []protocol.PeerInfo {
 	return out
 }
 
-// RefreshPeers queries all discovery nodes for fresh peer lists.
 func (n *Node) RefreshPeers() {
 	for _, addr := range n.DiscoveryAddrs {
 		conn, err := net.DialTimeout("tcp", addr, dialTimeout)
@@ -186,28 +177,26 @@ func (n *Node) RefreshPeers() {
 	}
 }
 
-// ListRemoteFiles fetches the file list from a specific peer.
 func (n *Node) ListRemoteFiles(peerAddr string) ([]protocol.FileInfo, string, error) {
 	conn, err := net.DialTimeout("tcp", peerAddr, dialTimeout)
 	if err != nil {
-		return nil, "", fmt.Errorf("peer unreachable (%s): %w", peerAddr, err)
+		return nil, "", fmt.Errorf("peer indisponível (%s): %w", peerAddr, err)
 	}
 	defer conn.Close()
-
 	if err := protocol.Send(conn, protocol.MsgListFiles, struct{}{}); err != nil {
-		return nil, "", fmt.Errorf("send list request: %w", err)
+		return nil, "", fmt.Errorf("envio falhou: %w", err)
 	}
 	env, err := protocol.Recv(conn, 10*time.Second)
 	if err != nil {
-		return nil, "", fmt.Errorf("recv file list: %w", err)
+		return nil, "", fmt.Errorf("sem resposta: %w", err)
 	}
 	if env.Type == protocol.MsgError {
 		var e protocol.ErrorPayload
 		protocol.Decode(env, &e)
-		return nil, "", fmt.Errorf("remote error: %s", e.Message)
+		return nil, "", fmt.Errorf("erro remoto: %s", e.Message)
 	}
 	if env.Type != protocol.MsgFileList {
-		return nil, "", fmt.Errorf("unexpected response: %s", env.Type)
+		return nil, "", fmt.Errorf("resposta inesperada: %s", env.Type)
 	}
 	var fl protocol.FileListPayload
 	if err := protocol.Decode(env, &fl); err != nil {
@@ -216,57 +205,86 @@ func (n *Node) ListRemoteFiles(peerAddr string) ([]protocol.FileInfo, string, er
 	return fl.Files, fl.PeerID, nil
 }
 
-// Download fetches a named file from peerAddr into DownloadDir.
-// It verifies the MD5 checksum and removes the file if corrupted.
-func (n *Node) Download(peerAddr, filename string) error {
+// Download baixa (ou retoma) um arquivo de peerAddr.
+// Salva progresso em <arquivo>.part + <arquivo>.state no DownloadDir.
+// Exibe porcentagem em tempo real no terminal.
+// Arquivo parcial já disponível é compartilhado imediatamente.
+func (n *Node) Download(peerAddr, filename string, progressCh chan<- float64) error {
+	clean := filepath.Base(filename)
+	partPath  := filepath.Join(n.DownloadDir, clean+".part")
+	statePath := filepath.Join(n.DownloadDir, clean+".state")
+	finalPath := filepath.Join(n.DownloadDir, clean)
+
+	// Se já existe arquivo completo, não baixa de novo
+	if _, err := os.Stat(finalPath); err == nil {
+		return fmt.Errorf("arquivo já existe: %s", finalPath)
+	}
+
+	// Verifica quanto já foi baixado (retomada)
+	var offset int64
+	if info, err := os.Stat(partPath); err == nil {
+		offset = info.Size()
+		log.Printf("[peer] retomando %s a partir do byte %d", clean, offset)
+	}
+
+	// Conecta e pede o trecho a partir do offset
 	conn, err := net.DialTimeout("tcp", peerAddr, dialTimeout)
 	if err != nil {
-		return fmt.Errorf("peer unreachable (%s): %w", peerAddr, err)
+		return fmt.Errorf("peer indisponível (%s): %w", peerAddr, err)
 	}
 	defer conn.Close()
 
-	if err := protocol.Send(conn, protocol.MsgDownload, protocol.DownloadPayload{Filename: filename}); err != nil {
-		return fmt.Errorf("send download request: %w", err)
+	if err := protocol.Send(conn, protocol.MsgDownload, protocol.DownloadPayload{
+		Filename: clean,
+		Offset:   offset,
+		Length:   0, // 0 = até o fim
+	}); err != nil {
+		return fmt.Errorf("envio falhou: %w", err)
 	}
 
-	// Expect FILE_DATA metadata envelope
+	// Recebe metadados
 	env, err := protocol.Recv(conn, 10*time.Second)
 	if err != nil {
-		return fmt.Errorf("recv metadata: %w", err)
+		return fmt.Errorf("sem resposta do peer: %w", err)
 	}
 	if env.Type == protocol.MsgError {
 		var e protocol.ErrorPayload
 		protocol.Decode(env, &e)
-		return fmt.Errorf("remote error: %s", e.Message)
+		return fmt.Errorf("erro remoto: %s", e.Message)
 	}
 	if env.Type != protocol.MsgFileData {
-		return fmt.Errorf("unexpected response: %s", env.Type)
+		return fmt.Errorf("resposta inesperada: %s", env.Type)
 	}
 	var meta protocol.FileDataPayload
 	if err := protocol.Decode(env, &meta); err != nil {
-		return fmt.Errorf("decode metadata: %w", err)
+		return fmt.Errorf("metadados inválidos: %w", err)
 	}
 
-	// Write to a temp file first to avoid incomplete files in download dir
 	if err := os.MkdirAll(n.DownloadDir, 0755); err != nil {
-		return fmt.Errorf("create download dir: %w", err)
+		return fmt.Errorf("criar diretório: %w", err)
 	}
 
-	tmpPath := filepath.Join(n.DownloadDir, meta.Filename+".tmp")
-	finalPath := filepath.Join(n.DownloadDir, meta.Filename)
+	// Salva estado inicial para que o fileserver possa servir o .part
+	if err := fileserver.SaveState(statePath, meta.Size, offset); err != nil {
+		log.Printf("[peer] aviso: não salvou estado: %v", err)
+	}
 
-	// Remove leftover temp files
-	os.Remove(tmpPath)
-
-	out, err := os.Create(tmpPath)
+	// Abre .part em modo append (retomada) ou cria do zero
+	var out *os.File
+	if offset > 0 {
+		out, err = os.OpenFile(partPath, os.O_WRONLY|os.O_APPEND, 0644)
+	} else {
+		out, err = os.Create(partPath)
+	}
 	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
+		return fmt.Errorf("criar arquivo parcial: %w", err)
 	}
 
-	// Receive raw bytes up to meta.Size, then read checksum line
+	// Recebe bytes com progresso em tempo real
 	h := md5.New()
 	buf := make([]byte, 32*1024)
-	remaining := meta.Size
+	remaining := meta.ChunkSize
+	received  := offset
 	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
 	for remaining > 0 {
@@ -274,32 +292,49 @@ func (n *Node) Download(peerAddr, filename string) error {
 		if toRead > remaining {
 			toRead = remaining
 		}
-		n, err := conn.Read(buf[:toRead])
-		if n > 0 {
-			chunk := buf[:n]
+		nr, rerr := conn.Read(buf[:toRead])
+		if nr > 0 {
+			chunk := buf[:nr]
 			h.Write(chunk)
 			if _, werr := out.Write(chunk); werr != nil {
 				out.Close()
-				os.Remove(tmpPath)
-				return fmt.Errorf("write error: %w", werr)
+				return fmt.Errorf("erro ao gravar: %w", werr)
 			}
-			remaining -= int64(n)
+			remaining -= int64(nr)
+			received  += int64(nr)
+
+			// Atualiza estado em disco periodicamente (a cada 256 KB)
+			if received%( 256*1024) == 0 {
+				fileserver.SaveState(statePath, meta.Size, received)
+			}
+
+			// Envia progresso para o canal (não bloqueia)
+			if progressCh != nil && meta.Size > 0 {
+				pct := float64(received) / float64(meta.Size) * 100
+				select {
+				case progressCh <- pct:
+				default:
+				}
+			}
 		}
-		if err != nil {
-			if err == io.EOF && remaining == 0 {
+		if rerr != nil {
+			if rerr == io.EOF && remaining == 0 {
 				break
 			}
 			out.Close()
-			os.Remove(tmpPath)
-			return fmt.Errorf("read error (remaining=%d): %w", remaining, err)
+			// Salva progresso antes de retornar o erro
+			fileserver.SaveState(statePath, meta.Size, received)
+			return fmt.Errorf("conexão interrompida (recebido %d/%d bytes): %w",
+				received, meta.Size, rerr)
 		}
 	}
 	out.Close()
 
-	localChecksum := hex.EncodeToString(h.Sum(nil))
+	// Salva estado final
+	fileserver.SaveState(statePath, meta.Size, received)
 
-	// Read the trailing checksum sent by the server
-	// The server sends "\n<checksum>\n" after the bytes
+	// Verifica checksum do trecho recebido
+	localChecksum := hex.EncodeToString(h.Sum(nil))
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	remoteChecksum := ""
 	scanner := bufio.NewScanner(conn)
@@ -310,18 +345,23 @@ func (n *Node) Download(peerAddr, filename string) error {
 			break
 		}
 	}
-
 	if remoteChecksum != "" && remoteChecksum != localChecksum {
-		os.Remove(tmpPath)
-		return fmt.Errorf("checksum mismatch: got %s want %s (file removed)", localChecksum, remoteChecksum)
+		// Checksum errado: apaga o .part e começa do zero na próxima
+		os.Remove(partPath)
+		os.Remove(statePath)
+		return fmt.Errorf("checksum inválido — arquivo corrompido, removido (tente novamente)")
 	}
 
-	// Atomic rename
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("rename temp file: %w", err)
+	// Arquivo completo: renomeia .part → nome final
+	if received >= meta.Size {
+		if err := os.Rename(partPath, finalPath); err != nil {
+			return fmt.Errorf("renomear arquivo: %w", err)
+		}
+		os.Remove(statePath)
+		log.Printf("[peer] download completo: %s (%d bytes)", clean, received)
+	} else {
+		log.Printf("[peer] download parcial salvo: %s (%d/%d bytes)", clean, received, meta.Size)
 	}
 
-	log.Printf("[peer] downloaded %s (%d bytes, md5=%s)", meta.Filename, meta.Size, localChecksum)
 	return nil
 }
