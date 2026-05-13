@@ -1,4 +1,5 @@
 build/
 peer-*.log
 downloads/
+compartilhados/
 *.tmp
